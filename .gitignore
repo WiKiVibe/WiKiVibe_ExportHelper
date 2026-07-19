@@ -1,0 +1,29 @@
+# Public ignore list (this file is committed and visible on GitHub).
+# Keep only common, non-sensitive patterns here.
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local env / logs / caches
+.env
+*.log
+.cache/
+.pytest_cache/

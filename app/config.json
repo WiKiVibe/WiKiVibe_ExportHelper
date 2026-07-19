@@ -1,0 +1,15 @@
+{
+  "output_subfolder": "DELIVERABLES",
+  "validate_media_under_selected_root": false,
+  "require_media_same_package_tree": true,
+  "mp4_width": 1920,
+  "mp4_height": 1080,
+  "mp4_bitrate_mbps": 25,
+  "mp4_audio_sample_rate": 48000,
+  "export_xml": true,
+  "export_aaf": true,
+  "export_mp4": true,
+  "ui_dot_step": 14,
+  "ui_dot_radius": 1.5,
+  "ui_dot_alpha": 20
+}
