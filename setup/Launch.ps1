@@ -4,6 +4,7 @@
 $ErrorActionPreference = "Stop"
 $BrandName = "WiKiVibe"
 $ProductName = "ExportHelper"
+$InstallFolderName = "WiKiVibe_ExportHelper"
 $AppName = "$BrandName $ProductName"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -37,7 +38,10 @@ function Resolve-AppScript {
     $repoApp = Join-Path (Split-Path -Parent $here) "app\export_helper.py"
     $candidates += $repoApp
     # 3) Installed location
-    $candidates += (Join-Path $env:LOCALAPPDATA "$BrandName\$ProductName\export_helper.py")
+    $candidates += (Join-Path $env:LOCALAPPDATA "$BrandName\$InstallFolderName\export_helper.py")
+    # Legacy install folder name
+    $candidates += (Join-Path $env:LOCALAPPDATA "$BrandName\ExportHelper\export_helper.py")
+    $candidates += (Join-Path $env:LOCALAPPDATA "$BrandName\ResolveTimelinePackager\export_helper.py")
 
     foreach ($c in $candidates) {
         if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }

@@ -14,7 +14,7 @@ $BrandName = "WiKiVibe"
 $ProductName = "ExportHelper"
 $AppName = "$BrandName $ProductName"                 # WiKiVibe ExportHelper
 $ResolveScriptName = "${BrandName}_${ProductName}"   # WiKiVibe_ExportHelper
-$InstallFolderName = $ProductName                    # ExportHelper under brand folder
+$InstallFolderName = "WiKiVibe_ExportHelper"         # under brand folder
 
 $SetupDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceRoot = Split-Path -Parent $SetupDir

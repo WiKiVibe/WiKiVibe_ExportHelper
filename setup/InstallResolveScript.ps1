@@ -6,9 +6,10 @@ $BrandName = "WiKiVibe"
 $ProductName = "ExportHelper"
 $AppName = "$BrandName $ProductName"
 $ResolveScriptName = "${BrandName}_${ProductName}"
+$InstallFolderName = "WiKiVibe_ExportHelper"
 $SetupDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceRoot = Split-Path -Parent $SetupDir
-$InstallRoot = Join-Path $env:LOCALAPPDATA "$BrandName\$ProductName"
+$InstallRoot = Join-Path $env:LOCALAPPDATA "$BrandName\$InstallFolderName"
 $ResolveMenuRoot = Join-Path $env:APPDATA "Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility"
 
 function Find-Python {
@@ -84,6 +85,7 @@ $legacyScripts = @(
     "WiKiVibe_ResolveTimelinePackager.py",
     "ResolveTimelinePackager.py"
 )
+# Note: do not list $ResolveScriptName here — that is the active menu script.
 $removed = @()
 foreach ($legacy in $legacyScripts) {
     $legacyPath = Join-Path $ResolveMenuRoot $legacy

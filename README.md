@@ -3,7 +3,7 @@
 English | [繁體中文](#繁體中文)
 
 **Brand:** WiKiVibe · **Product:** ExportHelper  
-Export **video XML**, **audio AAF**, and **H.264 MP4** from DaVinci Resolve (DRT / Media Management workflows).
+Export **video XML**, **audio AAF**, and **MOV** (H.264, MP4 fallback) from DaVinci Resolve (DRT / Media Management workflows).
 
 ---
 
@@ -38,7 +38,7 @@ These are **two different things**:
 
 | | Meaning | Rule |
 |--|---------|------|
-| **Output folder** | Where `DELIVERABLES` (XML / AAF / MP4) is written | **Any folder you like** |
+| **Output folder** | Where XML / AAF / MP4 are written (no subfolder) | **Any folder you like** |
 | **Media package tree** | Where timeline clips live on disk | Must share **one job parent folder** (default check **on**) |
 
 #### Media package tree (default ON)
@@ -68,10 +68,10 @@ Optional extra rule (default **off**): also force media under the Output folder 
 | Layer | Name | Where you see it |
 |-------|------|------------------|
 | Brand | **WiKiVibe** | Start Menu folder, GitHub org |
-| Product | **ExportHelper** | Install folder name |
+| Product | **ExportHelper** | Display / product short name |
 | Display | **WiKiVibe ExportHelper** | Desktop shortcut, window title |
 | Resolve menu | **WiKiVibe_ExportHelper** | Workspace → Scripts |
-| Install path | `%LOCALAPPDATA%\WiKiVibe\ExportHelper` | On disk after setup |
+| Install path | `%LOCALAPPDATA%\WiKiVibe\WiKiVibe_ExportHelper` | On disk after setup |
 
 ### Folder layout (source ZIP)
 
@@ -96,10 +96,15 @@ WiKiVibe_ExportHelper/
   tools/                  ← maintainer helpers (optional)
 ```
 
+Exports write **directly** into the chosen Output folder (no `DELIVERABLES` subfolder, no `package_report` files).  
+**MOV** video prefers **QuickTime `.mov`** (H.264), falls back to **MP4**. Quality uses UI **Restrict to (Mbps)** first, then auto.  
+NetworkOptimization / MultiPass / ExportSubtitle are soft-applied when the API accepts them.  
+If In is not set, it defaults to **00:00:00:00**; missing Out shows **(incomplete)** in orange-red.
+
 After install, a clean copy lives at:
 
 ```text
-%LOCALAPPDATA%\WiKiVibe\ExportHelper\
+%LOCALAPPDATA%\WiKiVibe\WiKiVibe_ExportHelper\
 ```
 
 ### Requirements
@@ -118,7 +123,7 @@ python app\export_helper.py --self-test
 
 ### Uninstall (manual)
 
-1. Delete `%LOCALAPPDATA%\WiKiVibe\ExportHelper`
+1. Delete `%LOCALAPPDATA%\WiKiVibe\WiKiVibe_ExportHelper`
 2. Delete Desktop / Start Menu shortcuts under **WiKiVibe**
 3. Delete `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\WiKiVibe_ExportHelper.py`
 
@@ -159,7 +164,7 @@ MIT — see [LICENSE](LICENSE). by [WiKiVibe](https://github.com/WiKiVibe)
 
 | | 意思 | 規則 |
 |--|------|------|
-| **Output folder** | 成品 `DELIVERABLES` 寫去哪 | **任意資料夾都可以** |
+| **Output folder** | 成品 XML／AAF／MP4 寫去哪（不再建子資料夾） | **任意資料夾都可以** |
 | **媒體專案樹** | timeline 素材在硬碟哪裡 | 必須在**同一個專案父資料夾**下（預設檢查 **開**） |
 
 #### 媒體專案樹（預設會擋不合理的）
@@ -189,10 +194,16 @@ MIT — see [LICENSE](LICENSE). by [WiKiVibe](https://github.com/WiKiVibe)
 | 層級 | 名稱 | 你會在哪看到 |
 |------|------|----------------|
 | 品牌 | **WiKiVibe** | 開始功能表資料夾、GitHub |
-| 產品 | **ExportHelper** | 安裝路徑資料夾名 |
+| 產品 | **ExportHelper** | 產品簡稱 |
+| 安裝資料夾 | **WiKiVibe_ExportHelper** | 硬碟／ZIP 資料夾名 |
 | 顯示名稱 | **WiKiVibe ExportHelper** | 桌面捷徑、視窗標題 |
 | Resolve 選單 | **WiKiVibe_ExportHelper** | Workspace → Scripts |
-| 安裝位置 | `%LOCALAPPDATA%\WiKiVibe\ExportHelper` | 硬碟路徑 |
+| 安裝位置 | `%LOCALAPPDATA%\WiKiVibe\WiKiVibe_ExportHelper` | 硬碟路徑 |
+
+成品會**直接**寫進你選的 Output 資料夾（不再建立 `DELIVERABLES`、也不再寫 `package_report`）。  
+**MOV** 優先 **QuickTime `.mov`**（H.264），失敗才退 **MP4**。品質用 UI **Restrict to（Mbps）**，再 fallback auto。  
+字幕／NetworkOptimization 等為 **best-effort**。  
+沒打 In 點時預設 **00:00:00:00**；抓不到 Out 時，狀態列會以**橘紅色**顯示 `(incomplete)`。
 
 ### 資料夾分層（下載的 ZIP）
 

@@ -1,5 +1,4 @@
 {
-  "output_subfolder": "DELIVERABLES",
   "validate_media_under_selected_root": false,
   "require_media_same_package_tree": true,
   "mp4_width": 1920,
@@ -13,3 +12,4 @@
   "ui_dot_radius": 1.5,
   "ui_dot_alpha": 20
 }
+

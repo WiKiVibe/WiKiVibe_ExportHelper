@@ -29,7 +29,6 @@ def load_config() -> dict:
     with CONFIG_PATH.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
     required = {
-        "output_subfolder",
         "validate_media_under_selected_root",
         "mp4_width",
         "mp4_height",
@@ -54,6 +53,8 @@ def load_config() -> dict:
     data.setdefault("ui_dot_alpha", 52)
     # Local-only key used on some machines; never required for shipping defaults.
     data.pop("verified_resolve_version", None)
+    # Legacy: used to create a DELIVERABLES subfolder; exports now write into Output folder.
+    data.pop("output_subfolder", None)
     return data
 
 
@@ -354,7 +355,15 @@ def current_timeline_state() -> dict:
     fps = get_timeline_fps(timeline, project)
     start_frame = get_timeline_start_frame(timeline)
     start_tc = get_timeline_start_timecode(timeline)
-    mark_in_tc = format_mark_timecode(mark_in, fps, start_frame, start_tc)
+    # No In mark → default to frame 0 / 00:00:00:00 (00000000).
+    mark_in_defaulted = mark_in is None
+    if mark_in is None:
+        mark_in = 0
+        mark_in_tc = "00:00:00:00"
+        if mark_source in (None, "", "none"):
+            mark_source = "default_in_0"
+    else:
+        mark_in_tc = format_mark_timecode(mark_in, fps, start_frame, start_tc)
     mark_out_tc = format_mark_timecode(mark_out, fps, start_frame, start_tc)
     inferred_root, media_root_warning = infer_media_root(media_paths)
     return {
@@ -373,6 +382,7 @@ def current_timeline_state() -> dict:
         "mark_out": mark_out,
         "mark_in_tc": mark_in_tc,
         "mark_out_tc": mark_out_tc,
+        "mark_in_defaulted": mark_in_defaulted,
         "timeline_fps": fps,
         "mark_source": mark_source,
     }
@@ -699,7 +709,7 @@ def verify_media_root(media_paths: list[str], media_root: Path) -> None:
     """
     Optional strict mode: require every timeline media file under media_root.
 
-    Output folder is normally free (where DELIVERABLES is written). Only when
+    Output folder is normally free (where deliverables are written). Only when
     config validate_media_under_selected_root is true do we hard-stop.
     """
     outside = media_outside_folder(media_paths, media_root)
@@ -851,20 +861,28 @@ def build_mp4_render_settings(
     audio_sample_rate: int,
     *,
     video_quality: int | str | None = None,
-    encoding_profile: str | None = "Main",
+    encoding_profile: str | None = None,
     include_audio_details: bool = True,
     include_format_size: bool = True,
     frame_rate: float | None = None,
     select_all_frames: bool = False,
 ) -> dict:
+    """
+    Build Deliver-compatible render settings for H.264.
+
+    Quality default = Restrict to (bitrate_mbps × 1000 kbps), matching the UI Mbps
+    field — same idea as Deliver "Restrict to … Kb/s". EncodingProfile is omitted
+    by default (Deliver "Auto").
+    """
     if (not select_all_frames) and mark_out < mark_in:
         raise ExportHelperError("Timeline Out is earlier than In.")
     if width < 320 or height < 240:
-        raise ExportHelperError("MP4 resolution is too small.")
+        raise ExportHelperError("Video resolution is too small.")
     if bitrate_mbps <= 0 or bitrate_mbps > 500:
-        raise ExportHelperError("MP4 bitrate must be between 0 and 500 Mbps.")
+        raise ExportHelperError("Video bitrate must be between 0 and 500 Mbps.")
     if video_quality is None:
-        # Docs: int bitrate, or 0 = automatic.
+        # Docs: int bitrate (kbps), or 0 = automatic / quality strings.
+        # Prefer explicit bitrate (UI Restrict to); auto is a fallback variant only.
         video_quality = int(round(float(bitrate_mbps) * 1000))
     target = str(delivery.resolve(strict=False))
     settings: dict = {
@@ -907,9 +925,31 @@ def _mp4_settings_variants(
 ) -> list[tuple[str, dict]]:
     bitrate_kbps = int(round(float(bitrate_mbps) * 1000))
     prefix = "allframes-" if select_all_frames else ""
+    # Order matters: Restrict-to bitrate first (UI Mbps), then auto quality,
+    # then slim / bare fallbacks. Do NOT put ExportSubtitle / NetworkOptimization
+    # in the base dict — unknown keys can make SetRenderSettings return False.
     return [
         (
-            f"{prefix}full-bitrate",
+            f"{prefix}restrict-bitrate",
+            build_mp4_render_settings(
+                delivery,
+                custom_name,
+                mark_in,
+                mark_out,
+                width,
+                height,
+                bitrate_mbps,
+                audio_sample_rate,
+                video_quality=bitrate_kbps,
+                encoding_profile=None,
+                include_audio_details=True,
+                include_format_size=True,
+                frame_rate=frame_rate,
+                select_all_frames=select_all_frames,
+            ),
+        ),
+        (
+            f"{prefix}restrict-main",
             build_mp4_render_settings(
                 delivery,
                 custom_name,
@@ -983,6 +1023,38 @@ def _mp4_settings_variants(
     ]
 
 
+def _try_soft_render_tweaks(
+    project, settings: dict, log: Callable[[str], None]
+) -> dict:
+    """
+    Best-effort extras after a working settings dict is accepted.
+
+    Applied one key at a time so a single unknown key never nukes the job.
+    If a soft pass fails, re-apply the last good settings.
+    """
+    current = dict(settings)
+    soft_keys = (
+        ("ExportSubtitle", False, "ExportSubtitle=False"),
+        ("NetworkOptimization", False, "NetworkOptimization=False"),
+        ("MultiPassEncode", False, "MultiPassEncode=False"),
+    )
+    for key, value, note in soft_keys:
+        try:
+            trial = dict(current)
+            trial[key] = value
+            if project.SetRenderSettings(trial):
+                current = trial
+                log(f"MOV: {note} applied")
+            else:
+                project.SetRenderSettings(current)
+        except Exception:
+            try:
+                project.SetRenderSettings(current)
+            except Exception:
+                pass
+    return current
+
+
 def apply_mp4_render_settings(
     project,
     timeline,
@@ -1034,8 +1106,9 @@ def apply_mp4_render_settings(
                 errors.append(f"{range_note}/{label}: exception {exc}")
                 continue
             if ok:
+                settings = _try_soft_render_tweaks(project, settings, log)
                 log(
-                    f"MP4 render settings accepted ({range_note} / {label}): "
+                    f"MOV render settings accepted ({range_note} / {label}): "
                     f"MarkIn={mi}, MarkOut={mo}"
                 )
                 return settings, mi, mo
@@ -1067,8 +1140,9 @@ def apply_mp4_render_settings(
                 errors.append(f"select-all/{label}: exception {exc}")
                 continue
             if ok:
+                settings = _try_soft_render_tweaks(project, settings, log)
                 log(
-                    f"MP4 render settings accepted via SelectAllFrames fallback "
+                    f"MOV render settings accepted via SelectAllFrames fallback "
                     f"({label}). In/Out marks were not applied to the render range."
                 )
                 return settings, int(start), int(end)
@@ -1080,7 +1154,7 @@ def apply_mp4_render_settings(
     start = get_timeline_start_frame(timeline)
     end = get_timeline_end_frame(timeline)
     raise ExportHelperError(
-        "Resolve rejected MP4 render settings.\n"
+        "Resolve rejected MOV render settings.\n"
         f"API marks In={mark_in}, Out={mark_out}; "
         f"timeline start={start}, end={end}; "
         f"{width}x{height}; target={delivery}\n"
@@ -1088,28 +1162,131 @@ def apply_mp4_render_settings(
     )
 
 
-def set_h264_mp4(project) -> tuple[str, str]:
-    candidates = [("mp4", "H264"), ("mp4", "H.264")]
+def _is_quicktime_format_token(token: str) -> bool:
+    t = str(token).strip().casefold()
+    return t in {"mov", "qt", "quicktime"} or "quicktime" in t or t.endswith(".mov")
+
+
+def _is_mp4_format_token(token: str) -> bool:
+    t = str(token).strip().casefold()
+    return t == "mp4" or "mp4" in t
+
+
+def _is_h264_codec_token(token: str) -> bool:
+    t = str(token).strip().casefold()
+    return "h.264" in t or "h264" in t or t in {"avc", "avc1"}
+
+
+def render_container_extension(render_format: str) -> str:
+    """Map Resolve format id/name to a file extension (.mov preferred)."""
+    if _is_quicktime_format_token(render_format):
+        return ".mov"
+    if _is_mp4_format_token(render_format):
+        return ".mp4"
+    return ".mov"
+
+
+def set_h264_video(project) -> tuple[str, str]:
+    """
+    Prefer QuickTime + H.264 (Deliver screenshot default), fall back to MP4 + H.264.
+    Returns (render_format, codec) as accepted by SetCurrentRenderFormatAndCodec.
+    """
     formats = project.GetRenderFormats() or {}
-    mp4_formats = []
+    qt_tokens: list[str] = []
+    mp4_tokens: list[str] = []
     for key, value in formats.items():
-        if "mp4" in str(key).lower() or str(value).lower() == "mp4":
-            mp4_formats.extend([str(key), str(value)])
-    for render_format in dict.fromkeys(["mp4", *mp4_formats]):
-        codecs = project.GetRenderCodecs(render_format) or {}
-        codec_candidates = []
+        for token in (key, value):
+            if token is None:
+                continue
+            s = str(token)
+            if _is_quicktime_format_token(s):
+                qt_tokens.append(s)
+            elif _is_mp4_format_token(s):
+                mp4_tokens.append(s)
+
+    # Explicit seeds first (API key names vary by Resolve build / locale).
+    format_order = list(
+        dict.fromkeys(
+            [
+                *["mov", "Mov", "MOV", "quicktime", "QuickTime", "Quicktime"],
+                *qt_tokens,
+                *["mp4", "Mp4", "MP4"],
+                *mp4_tokens,
+            ]
+        )
+    )
+
+    candidates: list[tuple[str, str]] = []
+    for render_format in format_order:
+        try:
+            codecs = project.GetRenderCodecs(render_format) or {}
+        except Exception:
+            codecs = {}
+        codec_tokens: list[str] = []
         for key, value in codecs.items():
-            if "h.264" in str(key).lower() or "h264" in str(key).lower() or "h.264" in str(value).lower() or "h264" in str(value).lower():
-                codec_candidates.extend([str(value), str(key)])
-        for codec in dict.fromkeys(["H264", "H.264", *codec_candidates]):
+            for token in (value, key):
+                if token is not None and _is_h264_codec_token(str(token)):
+                    codec_tokens.append(str(token))
+        for codec in dict.fromkeys(["H264", "H.264", "h264", *codec_tokens]):
             candidates.append((render_format, codec))
-    for render_format, codec in dict.fromkeys(candidates):
+
+    # Last-ditch pairs if GetRenderFormats was empty / incomplete.
+    for pair in (
+        ("mov", "H264"),
+        ("mov", "H.264"),
+        ("QuickTime", "H.264"),
+        ("QuickTime", "H264"),
+        ("mp4", "H264"),
+        ("mp4", "H.264"),
+    ):
+        candidates.append(pair)
+
+    tried: set[tuple[str, str]] = set()
+    for render_format, codec in candidates:
+        key = (str(render_format), str(codec))
+        if key in tried:
+            continue
+        tried.add(key)
         try:
             if project.SetCurrentRenderFormatAndCodec(render_format, codec):
-                return render_format, codec
+                return str(render_format), str(codec)
         except Exception:
             pass
-    raise ExportHelperError("Resolve could not set MP4 / H.264 render codec.")
+    raise ExportHelperError(
+        "Resolve could not set QuickTime/MP4 + H.264 render format.\n"
+        "Open Deliver and confirm MOV (H.264) is available for mov or mp4."
+    )
+
+
+# Back-compat alias used by older call sites / mental model.
+set_h264_mp4 = set_h264_video
+
+
+def _find_rendered_video(delivery: Path, custom_name: str, preferred_ext: str) -> Path:
+    """Locate the file Resolve wrote after a completed render job."""
+    preferred = preferred_ext if preferred_ext.startswith(".") else f".{preferred_ext}"
+    primary = delivery / f"{custom_name}{preferred}"
+    if primary.is_file() and primary.stat().st_size > 0:
+        return primary
+
+    patterns = [
+        f"{custom_name}*{preferred}",
+        f"{custom_name}*.mov",
+        f"{custom_name}*.mp4",
+        f"{custom_name}*.MOV",
+        f"{custom_name}*.MP4",
+    ]
+    matches: list[Path] = []
+    for pattern in patterns:
+        matches.extend(delivery.glob(pattern))
+    matches = [p for p in matches if p.is_file() and p.stat().st_size > 0]
+    if not matches:
+        raise ExportHelperError(
+            "Resolve reported render complete, but the MOV video file was not found.\n"
+            f"Looked under: {delivery} for name {custom_name}*"
+        )
+    matches.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return matches[0]
 
 
 def render_h264_mp4(
@@ -1121,10 +1298,20 @@ def render_h264_mp4(
     bitrate_mbps: float,
     log: Callable[[str], None],
 ) -> tuple[Path, dict]:
+    """
+    Export H.264 Single Clip: prefer QuickTime (.mov), fall back to MP4.
+    Quality uses UI Mbps as Restrict-to bitrate (kbps).
+    """
     mark_in = state["mark_in"]
     mark_out = state["mark_out"]
-    if mark_in is None or mark_out is None:
-        raise ExportHelperError("Current timeline has no In/Out marks; cannot export MP4.")
+    # In defaults to 0 (00:00:00:00) when unset; Out is still required.
+    if mark_in is None:
+        mark_in = 0
+    if mark_out is None:
+        raise ExportHelperError(
+            "Current timeline has no Out mark; set Out (O) before exporting MOV. "
+            "In defaults to 00:00:00:00 when unset."
+        )
     project = state["project"]
     source = state["timeline"]
     resolve = state.get("resolve")
@@ -1134,7 +1321,9 @@ def render_h264_mp4(
     job_id = None
     try:
         if not project.SetCurrentTimeline(source):
-            raise ExportHelperError("Could not switch back to source timeline before MP4 export.")
+            raise ExportHelperError(
+                "Could not switch back to source timeline before MOV export."
+            )
         # Deliver page is the most reliable context for render queue APIs.
         if resolve is not None:
             try:
@@ -1143,8 +1332,9 @@ def render_h264_mp4(
             except Exception:
                 previous_page = None
 
-        render_format, codec = set_h264_mp4(project)
-        log(f"Render format/codec: {render_format} / {codec}")
+        render_format, codec = set_h264_video(project)
+        container_ext = render_container_extension(render_format)
+        log(f"Render format/codec: {render_format} / {codec} → *{container_ext}")
         if not project.SetCurrentRenderMode(1):
             raise ExportHelperError("Could not set Resolve Render Mode to Single Clip.")
 
@@ -1168,7 +1358,7 @@ def render_h264_mp4(
         custom_name = safe_custom
         job_id = project.AddRenderJob()
         if not job_id:
-            raise ExportHelperError("Could not add H.264 MP4 to the Render Queue.")
+            raise ExportHelperError("Could not add MOV job to the Render Queue.")
         in_tc = format_mark_timecode(
             mark_in,
             float(state.get("timeline_fps") or 24),
@@ -1186,35 +1376,39 @@ def render_h264_mp4(
             if in_tc and out_tc
             else f"frames {mark_in} → {mark_out}"
         )
+        vq = settings.get("VideoQuality")
+        encode_label = (
+            "auto"
+            if vq == 0 or vq in ("Best", "High", "Medium", "Low", "Least")
+            else f"Restrict to {bitrate_mbps:g} Mbps"
+        )
         log(
-            f"Starting H.264 MP4 export: HD {width}×{height} / {bitrate_mbps:g} Mbps / "
-            f"In/Out {range_label}"
+            f"Starting MOV export ({container_ext}): {width}×{height} / "
+            f"{encode_label} / In/Out {range_label}"
         )
         if not project.StartRendering([job_id], False):
-            raise ExportHelperError("Resolve could not start the H.264 MP4 render job.")
+            raise ExportHelperError("Resolve could not start the MOV render job.")
         last_percent = -1
         while project.IsRenderingInProgress():
             status = project.GetRenderJobStatus(job_id) or {}
             percent = int(float(status.get("CompletionPercentage", 0) or 0))
             if percent >= last_percent + 5:
-                log(f"MP4 render: {percent}%")
+                log(f"MOV render: {percent}%")
                 last_percent = percent
             time.sleep(1)
         status = project.GetRenderJobStatus(job_id) or {}
         job_status = str(status.get("JobStatus", ""))
         if job_status.casefold() not in {"complete", "completed"}:
-            raise ExportHelperError(f"MP4 render did not complete: {job_status or status}")
-        output_path = delivery / f"{custom_name}.mp4"
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            matches = sorted(delivery.glob(f"{custom_name}*.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
-            if not matches:
-                raise ExportHelperError("Resolve reported render complete, but the MP4 file was not found.")
-            output_path = matches[0]
+            raise ExportHelperError(
+                f"MOV render did not complete: {job_status or status}"
+            )
+        output_path = _find_rendered_video(delivery, custom_name, container_ext)
         project.DeleteRenderJob(job_id)
         job_id = None
         return output_path, {
             "format": render_format,
             "codec": codec,
+            "extension": output_path.suffix,
             "mark_in": mark_in,
             "mark_out": mark_out,
             "width": width,
@@ -1224,7 +1418,7 @@ def render_h264_mp4(
     finally:
         if job_id and not project.IsRenderingInProgress():
             # Leave failed jobs in the queue for inspection.
-            log(f"MP4 render job left in Render Queue: {job_id}")
+            log(f"MOV render job left in Render Queue: {job_id}")
         try:
             old_format = previous_format_codec.get("format")
             old_codec = previous_format_codec.get("codec")
@@ -1236,47 +1430,6 @@ def render_h264_mp4(
                 resolve.OpenPage(previous_page)
         except Exception:
             pass
-
-
-def write_report(delivery: Path, payload: dict) -> None:
-    (delivery / "package_report.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8-sig"
-    )
-    selected = payload.get("export_selected") or {}
-    lines = [
-        "WiKiVibe ExportHelper Report",
-        "",
-        f"Result: {payload['result']}",
-        f"Resolve：{payload['resolve_version']}",
-        f"Project: {payload['project']}",
-        f"Source timeline: {payload['source_timeline']}",
-        f"Media root: {payload['media_root']}",
-        f"Verified media paths: {payload['verified_media_path_count']}",
-        "Outside media root: 0",
-        (
-            "Export selection: "
-            f"XML={'ON' if selected.get('xml') else 'OFF'} / "
-            f"AAF={'ON' if selected.get('aaf') else 'OFF'} / "
-            f"MP4={'ON' if selected.get('mp4') else 'OFF'}"
-        ),
-        f"Video XML: {payload.get('xml_path') or '(skipped)'}",
-        f"Audio AAF: {payload.get('aaf_path') or '(skipped)'}",
-        f"H.264 MP4: {payload.get('mp4_path') or '(skipped)'}",
-    ]
-    if selected.get("mp4"):
-        lines.append(
-            f"MP4 settings: {payload['mp4_width']}×{payload['mp4_height']} / "
-            f"{payload['mp4_bitrate_mbps']:g} Mbps"
-        )
-        lines.append(f"MP4 range: In {payload['mark_in']} → Out {payload['mark_out']}")
-    lines.extend(
-        [
-            f"Completed: {payload['completed_at']}",
-            "",
-            "VIDEO_ONLY / AUDIO_ONLY copies are created only for selected XML/AAF. The original DRT timeline is not modified.",
-        ]
-    )
-    (delivery / "package_report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
 
 
 def export_current_timeline(
@@ -1295,15 +1448,18 @@ def export_current_timeline(
     do_aaf = bool(config.get("export_aaf", True) if export_aaf is None else export_aaf)
     do_mp4 = bool(config.get("export_mp4", True) if export_mp4 is None else export_mp4)
     if not (do_xml or do_aaf or do_mp4):
-        raise ExportHelperError("Enable at least one export: XML, AAF, or MP4.")
+        raise ExportHelperError("Enable at least one export: XML, AAF, or MOV.")
 
     width = int(mp4_width if mp4_width is not None else config["mp4_width"])
     height = int(mp4_height if mp4_height is not None else config["mp4_height"])
     bitrate_mbps = float(
         mp4_bitrate_mbps if mp4_bitrate_mbps is not None else config["mp4_bitrate_mbps"]
     )
-    if do_mp4 and (state["mark_in"] is None or state["mark_out"] is None):
-        raise ExportHelperError("Set In/Out marks on the current timeline. MP4 exports only that range.")
+    if do_mp4 and state["mark_out"] is None:
+        raise ExportHelperError(
+            "Set an Out mark on the current timeline. "
+            "MOV exports In→Out; In defaults to 00:00:00:00 when unset."
+        )
     project = state["project"]
     source = state["timeline"]
     media_root = media_root.resolve(strict=False)
@@ -1321,7 +1477,7 @@ def export_current_timeline(
         elif message:
             log(f"Media package tree warning (check disabled): {message.splitlines()[0]}")
 
-    # 2) Output folder is free (where DELIVERABLES is written).
+    # 2) Output folder is free — deliverables are written directly here (no subfolder).
     # Optional strict mode can also require media under that Output folder.
     outside = media_outside_folder(state["media_paths"], media_root)
     if outside:
@@ -1335,11 +1491,9 @@ def export_current_timeline(
                 f"(OK — Output is only the deliverable destination). e.g. {sample}{more}"
             )
 
-    delivery = media_root / safe_name(str(config["output_subfolder"]))
-    delivery.mkdir(parents=True, exist_ok=True)
+    delivery = media_root
     log(f"Current timeline: {source.GetName()}")
     log(f"Output folder: {media_root}")
-    log(f"Deliverables: {delivery}")
     log(
         "Export selection: "
         f"XML={'ON' if do_xml else 'OFF'} / "
@@ -1422,7 +1576,7 @@ def export_current_timeline(
             raise ExportHelperError(f"Output file missing or empty: {artifact}")
 
     if do_mp4:
-        mp4_name = f"{base_name}_H264"
+        mp4_name = f"{base_name}_MOV"
         mp4_path, mp4_settings = render_h264_mp4(
             state=state,
             delivery=delivery,
@@ -1438,7 +1592,7 @@ def export_current_timeline(
         for enabled, name in (
             (do_xml, "XML"),
             (do_aaf, "AAF"),
-            (do_mp4, "H.264 MP4"),
+            (do_mp4, "MOV"),
         )
         if enabled
     ]
@@ -1446,34 +1600,15 @@ def export_current_timeline(
     if not state["project_manager"].SaveProject():
         raise ExportHelperError(f"{done_label} exported, but saving the Resolve project failed.")
 
-    payload = {
-        "result": "PASS",
-        "resolve_version": state["version"],
-        "project": project.GetName(),
-        "source_timeline": source.GetName(),
-        "export_selected": {"xml": do_xml, "aaf": do_aaf, "mp4": do_mp4},
-        "video_only_timeline": video_name,
-        "audio_only_timeline": audio_name,
-        "media_root": str(media_root),
-        "verified_media_path_count": len(state["media_paths"]),
-        "source_video_item_count": source_video_items,
-        "source_audio_item_count": source_audio_items,
-        "generated_or_unlinked_items": state["generated_items"],
-        "retained_empty_tracks": retained_empty_tracks,
-        "xml_path": str(xml_path) if xml_path else None,
-        "aaf_path": str(aaf_path) if aaf_path else None,
-        "mp4_path": str(mp4_path) if mp4_path else None,
-        "mp4_width": width if do_mp4 else None,
-        "mp4_height": height if do_mp4 else None,
-        "mp4_bitrate_mbps": bitrate_mbps if do_mp4 else None,
-        "mark_in": mp4_settings["mark_in"] if mp4_settings else state["mark_in"],
-        "mark_out": mp4_settings["mark_out"] if mp4_settings else state["mark_out"],
-        "mp4_render_format": mp4_settings["format"] if mp4_settings else None,
-        "mp4_render_codec": mp4_settings["codec"] if mp4_settings else None,
-        "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
-    write_report(delivery, payload)
-    log(f"Done: {done_label} and report written.")
+    if xml_path:
+        log(f"XML: {xml_path}")
+    if aaf_path:
+        log(f"AAF: {aaf_path}")
+    if mp4_path:
+        log(f"MOV: {mp4_path}")
+    if retained_empty_tracks:
+        log(f"Cleared empty tracks on export copies: {retained_empty_tracks}")
+    log(f"Done: {done_label} written to {delivery}")
     return delivery
 
 
@@ -1487,14 +1622,35 @@ def cli_main() -> int:
     parser.add_argument("--bitrate", type=float)
     parser.add_argument("--skip-xml", action="store_true", help="Do not export video XML")
     parser.add_argument("--skip-aaf", action="store_true", help="Do not export audio AAF")
-    parser.add_argument("--skip-mp4", action="store_true", help="Do not export H.264 MP4")
+    parser.add_argument(
+        "--skip-mp4",
+        action="store_true",
+        help="Do not export MOV video (QuickTime H.264 / MP4 fallback)",
+    )
     args = parser.parse_args()
     if args.self_test:
         config = load_config()
-        assert config["output_subfolder"] == "DELIVERABLES"
+        assert "output_subfolder" not in config
         assert path_is_under(r"D:\PKG\clip.mov", r"D:\PKG")
         assert not path_is_under(r"D:\SOURCE\clip.mov", r"D:\PKG")
         assert config.get("export_xml") is True
+        settings = build_mp4_render_settings(
+            Path(r"D:\out"), "clip", 0, 100, 1920, 1080, 25, 48000
+        )
+        # Restrict-to bitrate (UI Mbps → kbps); no soft keys in base dict.
+        assert settings.get("VideoQuality") == 25000
+        assert "ExportSubtitle" not in settings
+        assert "EncodingProfile" not in settings
+        variants = _mp4_settings_variants(
+            Path(r"D:\out"), "clip", 0, 100, 1920, 1080, 25, 48000, 24.0
+        )
+        assert variants[0][0] == "restrict-bitrate"
+        assert variants[0][1].get("VideoQuality") == 25000
+        assert variants[-1][0] == "bare"
+        assert "VideoQuality" not in variants[-1][1]
+        assert render_container_extension("QuickTime") == ".mov"
+        assert render_container_extension("mov") == ".mov"
+        assert render_container_extension("mp4") == ".mp4"
         print("SELF_TEST_PASS")
         return 0
     if args.preflight:
@@ -1576,6 +1732,7 @@ def launch_gui() -> None:
     INPUT_BG = "#1D1D1D"
     TEXT = "#e6e6e6"
     MUTED = "#9a9a9a"
+    WARN_ORANGE = "#ff6a35"  # incomplete In/Out hint
     ON_LIGHT = "#202020"
     KEY_OFF = "#c8c8c8"
     KEY_ON = "#f4f4f4"
@@ -1923,7 +2080,7 @@ def launch_gui() -> None:
             path_row.setSpacing(8)
             self.media_root_edit = QLineEdit()
             self.media_root_edit.setPlaceholderText(
-                "Where to write DELIVERABLES (any folder you like)…"
+                "Where to write XML / AAF / MOV video (any folder you like)…"
             )
             browse_btn = QPushButton("Browse…")
             browse_btn.setObjectName("ghost")
@@ -1949,7 +2106,7 @@ def launch_gui() -> None:
                 "AAF", bool(self._config.get("export_aaf", True))
             )
             self.toggle_mp4 = self._make_export_toggle(
-                "MP4", bool(self._config.get("export_mp4", True))
+                "MOV", bool(self._config.get("export_mp4", True))
             )
             for btn in (self.toggle_xml, self.toggle_aaf, self.toggle_mp4):
                 btn.toggled.connect(self._on_export_toggles_changed)
@@ -1976,7 +2133,9 @@ def launch_gui() -> None:
                 edit.setMaximumWidth(140)
             fields.addLayout(self._field_column("Width", self.width_edit))
             fields.addLayout(self._field_column("Height", self.height_edit))
-            fields.addLayout(self._field_column("Bitrate（Mbps）", self.bitrate_edit))
+            fields.addLayout(
+                self._field_column("Restrict to（Mbps）", self.bitrate_edit)
+            )
             fields.addStretch(1)
             mp4_layout.addLayout(fields)
             outer.addWidget(mp4_card)
@@ -2145,7 +2304,7 @@ def launch_gui() -> None:
                 for enabled, name in (
                     (do_xml, "XML"),
                     (do_aaf, "AAF"),
-                    (do_mp4, "MP4"),
+                    (do_mp4, "MOV"),
                 )
                 if enabled
             ]
@@ -2197,7 +2356,7 @@ def launch_gui() -> None:
         def choose_root(self) -> None:
             selected = QFileDialog.getExistingDirectory(
                 self,
-                "Select output folder (DELIVERABLES will be created here)",
+                "Select output folder (files are written here directly)",
                 self.media_root_edit.text().strip() or str(Path.home()),
             )
             if selected:
@@ -2210,27 +2369,35 @@ def launch_gui() -> None:
                 v_count = int(state["timeline"].GetTrackCount("video"))
                 a_count = int(state["timeline"].GetTrackCount("audio"))
                 media_count = len(state["media_paths"])
-                in_tc = state.get("mark_in_tc")
+                in_tc = state.get("mark_in_tc") or "00:00:00:00"
                 out_tc = state.get("mark_out_tc")
-                if state["mark_in"] is not None and state["mark_out"] is not None:
-                    if in_tc and out_tc:
+                marks_warn = False
+                if state["mark_out"] is not None:
+                    if out_tc:
                         marks = f"In {in_tc} / Out {out_tc}"
                     else:
                         marks = f"In {state['mark_in']} / Out {state['mark_out']}"
-                elif state["mark_in"] is not None or state["mark_out"] is not None:
-                    left = in_tc or (
-                        state["mark_in"] if state["mark_in"] is not None else "?"
-                    )
-                    right = out_tc or (
-                        state["mark_out"] if state["mark_out"] is not None else "?"
-                    )
-                    marks = f"In {left} / Out {right} (incomplete)"
+                    if state.get("mark_in_defaulted"):
+                        marks = f"{marks} (In default 00:00:00:00)"
                 else:
-                    marks = "In / Out not set"
-                self.timeline_label.setText(
-                    f"{state['project'].GetName()}  /  {timeline_name}  ·  {marks}"
-                )
-                self.pill_dot.setStyleSheet("color: #f0f0f0;")
+                    # Missing Out (or both marks unreadable): warn in orange-red.
+                    right = out_tc if out_tc else "?"
+                    marks = f"In {in_tc} / Out {right} (incomplete)"
+                    marks_warn = True
+                project_name = state["project"].GetName()
+                if marks_warn:
+                    self.timeline_label.setTextFormat(Qt.TextFormat.RichText)
+                    self.timeline_label.setText(
+                        f"{project_name}  /  {timeline_name}  ·  "
+                        f'<span style="color:{WARN_ORANGE};">{marks}</span>'
+                    )
+                    self.pill_dot.setStyleSheet(f"color: {WARN_ORANGE};")
+                else:
+                    self.timeline_label.setTextFormat(Qt.TextFormat.PlainText)
+                    self.timeline_label.setText(
+                        f"{project_name}  /  {timeline_name}  ·  {marks}"
+                    )
+                    self.pill_dot.setStyleSheet("color: #f0f0f0;")
                 # Bottom status: compact timeline readout.
                 self._set_timeline_status(
                     f"{timeline_name} ; V{v_count}/A{a_count}/{media_count}Media"
@@ -2257,23 +2424,30 @@ def launch_gui() -> None:
                 elif pkg_msg:
                     first = pkg_msg.splitlines()[0]
                     self.append_log(f"Media package tree: FAIL — {first}")
-                if state["mark_in"] is not None and state["mark_out"] is not None:
-                    in_tc = state.get("mark_in_tc") or "?"
+                if state["mark_out"] is not None:
+                    in_tc = state.get("mark_in_tc") or "00:00:00:00"
                     out_tc = state.get("mark_out_tc") or "?"
                     fps = state.get("timeline_fps")
                     fps_label = f"{fps:g}" if isinstance(fps, (int, float)) else "?"
+                    default_note = (
+                        "; In defaulted to 00:00:00:00"
+                        if state.get("mark_in_defaulted")
+                        else ""
+                    )
                     self.append_log(
                         f"In/Out: {in_tc} → {out_tc}  "
                         f"(frames {state['mark_in']}–{state['mark_out']}, "
-                        f"{fps_label} fps, source: {state.get('mark_source') or 'timeline'})"
+                        f"{fps_label} fps, source: {state.get('mark_source') or 'timeline'}"
+                        f"{default_note})"
                     )
                 else:
                     self.append_log(
-                        "In/Out not readable from API yet. "
-                        "Press I/O once on the timeline, or click Refresh."
+                        "Out mark not readable yet (In defaults to 00:00:00:00). "
+                        "Press O on the timeline, or click Refresh."
                     )
                 return True
             except Exception as exc:
+                self.timeline_label.setTextFormat(Qt.TextFormat.PlainText)
                 self.timeline_label.setText("Timeline not ready")
                 self.pill_dot.setStyleSheet(f"color: {MUTED};")
                 self._set_timeline_status("Timeline not loaded")
@@ -2285,7 +2459,9 @@ def launch_gui() -> None:
         def export_clicked(self) -> None:
             do_xml, do_aaf, do_mp4 = self._selected_exports()
             if not (do_xml or do_aaf or do_mp4):
-                QMessageBox.warning(self, "Nothing selected", "Enable at least one of: XML, AAF, or MP4.")
+                QMessageBox.warning(
+                    self, "Nothing selected", "Enable at least one of: XML, AAF, or MOV."
+                )
                 return
 
             selected_root = Path(self.media_root_edit.text()).expanduser()
@@ -2293,7 +2469,7 @@ def launch_gui() -> None:
                 QMessageBox.critical(
                     self,
                     "Folder error",
-                    "Please select an output folder. DELIVERABLES will be created inside it.",
+                    "Please select an output folder. XML / AAF / MOV video are written there directly.",
                 )
                 return
 
@@ -2316,7 +2492,7 @@ def launch_gui() -> None:
                         int(self._config["mp4_audio_sample_rate"]),
                     )
                 except (ValueError, ExportHelperError) as exc:
-                    QMessageBox.critical(self, "MP4 settings error", str(exc))
+                    QMessageBox.critical(self, "MOV settings error", str(exc))
                     return
 
             updated = dict(self._config)
@@ -2340,7 +2516,8 @@ def launch_gui() -> None:
                 lines.append("• Audio-only AAF")
             if do_mp4:
                 lines.append(
-                    f"• H.264 MP4 for In/Out range ({width}×{height} / {bitrate:g} Mbps）"
+                    f"• MOV (H.264, MP4 fallback) In/Out "
+                    f"({width}×{height} / Restrict to {bitrate:g} Mbps)"
                 )
             lines.append("\nThe original timeline will not be modified.")
             reply = QMessageBox.question(
