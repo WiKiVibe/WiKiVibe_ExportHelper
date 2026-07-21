@@ -5,6 +5,10 @@ English | [繁體中文](#繁體中文)
 **Brand:** WiKiVibe · **Product:** ExportHelper  
 Export **video XML**, **audio AAF**, and **MOV** (H.264, MP4 fallback) from DaVinci Resolve (DRT / Media Management workflows).
 
+<p align="center">
+  <img src="assets/preview.png" width="900" alt="WiKiVibe ExportHelper 預覽畫面">
+</p>
+
 ---
 
 ## English
