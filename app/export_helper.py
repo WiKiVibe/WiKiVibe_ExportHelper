@@ -1576,7 +1576,7 @@ def export_current_timeline(
             raise ExportHelperError(f"Output file missing or empty: {artifact}")
 
     if do_mp4:
-        mp4_name = f"{base_name}_MOV"
+        mp4_name = base_name
         mp4_path, mp4_settings = render_h264_mp4(
             state=state,
             delivery=delivery,
