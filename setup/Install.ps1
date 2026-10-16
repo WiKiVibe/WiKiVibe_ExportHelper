@@ -53,6 +53,78 @@ function Find-Python {
     return $null
 }
 
+function Confirm-Msg([string]$Text, [string]$Title = $AppName) {
+    if ($Silent) { Write-Host $Text; return $true }
+    Add-Type -AssemblyName PresentationFramework | Out-Null
+    $r = [System.Windows.MessageBox]::Show($Text, $Title, "YesNo", "Question")
+    return ($r -eq "Yes")
+}
+
+# Official python.org per-user installer (no admin needed).
+$PythonVersion = "3.12.10"
+$PythonInstallerUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
+
+function Install-PythonFromOrg {
+    $tmpDir = Join-Path $env:TEMP "WiKiVibe_PythonSetup"
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $exe = Join-Path $tmpDir "python-$PythonVersion-amd64.exe"
+
+    Write-Host "Downloading Python $PythonVersion ..."
+    Write-Host "  $PythonInstallerUrl"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $oldProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        Invoke-WebRequest -Uri $PythonInstallerUrl -OutFile $exe -UseBasicParsing
+    } finally {
+        $ProgressPreference = $oldProgress
+    }
+
+    $sig = Get-AuthenticodeSignature -LiteralPath $exe
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "Python Software Foundation") {
+        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+        throw "Downloaded installer signature check failed ($($sig.Status))."
+    }
+
+    Write-Host "Installing Python $PythonVersion (per-user, silent) ..."
+    $installArgs = @(
+        "/quiet",
+        "InstallAllUsers=0",
+        "PrependPath=1",
+        "Include_pip=1",
+        "Include_launcher=1",
+        "InstallLauncherAllUsers=0",
+        "Include_test=0",
+        "Include_doc=0"
+    )
+    $proc = Start-Process -FilePath $exe -ArgumentList $installArgs -Wait -PassThru
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0) {
+        throw "Python installer exit code $($proc.ExitCode)."
+    }
+}
+
+function Install-PythonFromWinget {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "winget not available."
+    }
+    Write-Host "Installing Python via winget ..."
+    & winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget exit code $LASTEXITCODE."
+    }
+}
+
+function Install-Python {
+    try {
+        Install-PythonFromOrg
+    } catch {
+        Write-Host "python.org install failed: $_"
+        Write-Host "Trying winget ..."
+        Install-PythonFromWinget
+    }
+}
+
 function New-Shortcut([string]$LinkPath, [string]$TargetPath, [string]$Arguments, [string]$WorkDir, [string]$Icon) {
     $shell = New-Object -ComObject WScript.Shell
     $sc = $shell.CreateShortcut($LinkPath)
@@ -77,18 +149,37 @@ if (-not (Test-Path -LiteralPath (Join-Path $AppSource "export_helper.py"))) {
 
 $python = Find-Python
 if (-not $python) {
-    $msg = @"
+    $ask = @"
 Python 3.10+ was not found.
+Download and install Python $PythonVersion automatically now?
+(about 25 MB, per-user, no admin needed)
 
+找不到 Python 3.10+。
+要自動下載並安裝 Python $PythonVersion 嗎？
+（約 25 MB，只裝在目前使用者，不需系統管理員權限）
+"@
+    $manual = @"
 Please install Python from https://www.python.org/downloads/
 (check Add python.exe to PATH), then run START_HERE.bat again.
 
-找不到 Python 3.10+。
-請先安裝 Python：https://www.python.org/downloads/
+請手動安裝 Python：https://www.python.org/downloads/
 （建議勾選 Add python.exe to PATH），再重新執行 START_HERE.bat。
 "@
-    Show-Msg $msg
-    exit 2
+    if (-not (Confirm-Msg $ask)) {
+        Show-Msg $manual
+        exit 2
+    }
+    try {
+        Install-Python
+    } catch {
+        Show-Msg "Automatic Python install failed / 自動安裝 Python 失敗：`n$_`n`n$manual"
+        exit 2
+    }
+    $python = Find-Python
+    if (-not $python) {
+        Show-Msg "Python was installed but could not be found.`nPython 已安裝但找不到執行檔。`n`n$manual"
+        exit 2
+    }
 }
 Write-Host "Python: $python"
 

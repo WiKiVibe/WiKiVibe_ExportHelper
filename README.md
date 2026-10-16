@@ -17,7 +17,7 @@ Export **video XML**, **audio AAF**, and **MOV** (H.264, MP4 fallback) from DaVi
 
 1. Download ZIP from GitHub → **Code → Download ZIP**
 2. Unzip the folder
-3. Double-click **`START_HERE.bat`** (first-time setup)
+3. Double-click **`START_HERE.bat`** (first-time setup — installs Python and PyQt6 automatically if missing)
 4. When the success dialog appears, open the app via:
 
 | Open from | What you click |
@@ -115,7 +115,7 @@ After install, a clean copy lives at:
 
 - Windows 10/11
 - DaVinci Resolve **Studio**
-- Python 3.10+ ([python.org](https://www.python.org/downloads/) — enable *Add python.exe to PATH*)
+- Python 3.10+ — **installed automatically** by `START_HERE.bat` if missing (Python 3.12, per-user, no admin; needs internet)
 
 ### CLI (optional)
 
@@ -143,7 +143,7 @@ MIT — see [LICENSE](LICENSE). by [WiKiVibe](https://github.com/WiKiVibe)
 
 1. 從 GitHub 下載 ZIP（**Code → Download ZIP**）
 2. 解壓縮
-3. **雙擊 `START_HERE.bat`**（第一次安裝）
+3. **雙擊 `START_HERE.bat`**（第一次安裝；沒有 Python 會自動下載安裝 Python 和 PyQt6，需網路）
 4. 看到成功視窗後，用下面任一方式開啟：
 
 | 從哪開 | 點什麼 |
@@ -214,6 +214,12 @@ MIT — see [LICENSE](LICENSE). by [WiKiVibe](https://github.com/WiKiVibe)
 - 根目錄：`START_HERE.bat`（先裝）、`Launch.bat`（之後開）
 - `app\`：主程式
 - `setup\`：安裝／啟動腳本（一般不用手動開）
+
+### 需求
+
+- Windows 10/11
+- DaVinci Resolve **Studio**
+- Python 3.10+：沒有的話 `START_HERE.bat` 會**自動安裝** Python 3.12（只裝在目前使用者、不需系統管理員權限、需要網路）
 
 ### 授權
 

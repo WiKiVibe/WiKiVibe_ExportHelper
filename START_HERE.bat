@@ -5,7 +5,7 @@ cd /d "%~dp0"
 echo.
 echo  WiKiVibe ExportHelper - first-time setup
 echo  -----------------------------------------
-echo  This will install Python packages and create shortcuts.
+echo  This will install Python (if missing), PyQt6, and create shortcuts.
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup\Install.ps1" %*
 set ERR=%ERRORLEVEL%
