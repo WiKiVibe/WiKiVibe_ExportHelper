@@ -42,6 +42,8 @@ def load_config() -> dict:
     data.setdefault("export_xml", True)
     data.setdefault("export_aaf", True)
     data.setdefault("export_mp4", True)
+    data.setdefault("export_srt", False)
+    data.setdefault("last_output_folder", "")
     # Media package tree: require shared parent deeper than drive root (default ON).
     data.setdefault("require_media_same_package_tree", True)
     # Optional: also require media under Output folder (default OFF — output is free).
@@ -353,6 +355,7 @@ def current_timeline_state() -> dict:
         timeline, project=project, resolve=resolve
     )
     fps = get_timeline_fps(timeline, project)
+    timeline_width, timeline_height = get_timeline_resolution(timeline, project)
     start_frame = get_timeline_start_frame(timeline)
     start_tc = get_timeline_start_timecode(timeline)
     # No In mark → default to frame 0 / 00:00:00:00 (00000000).
@@ -384,6 +387,8 @@ def current_timeline_state() -> dict:
         "mark_out_tc": mark_out_tc,
         "mark_in_defaulted": mark_in_defaulted,
         "timeline_fps": fps,
+        "timeline_width": timeline_width,
+        "timeline_height": timeline_height,
         "mark_source": mark_source,
     }
 
@@ -424,6 +429,39 @@ def get_timeline_fps(timeline, project=None) -> float:
         except ValueError:
             continue
     return 24.0
+
+
+def get_timeline_resolution(timeline, project=None) -> tuple[int | None, int | None]:
+    """Return the current timeline canvas size without changing Resolve settings."""
+    for owner in (timeline, project):
+        if owner is None:
+            continue
+        try:
+            width = int(float(owner.GetSetting("timelineResolutionWidth")))
+            height = int(float(owner.GetSetting("timelineResolutionHeight")))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        except Exception:
+            continue
+        if width > 0 and height > 0:
+            return width, height
+    return None, None
+
+
+def orient_dimensions_to_timeline(
+    width: int,
+    height: int,
+    timeline_width: int | None,
+    timeline_height: int | None,
+) -> tuple[int, int, bool]:
+    """Swap output dimensions only when their orientation differs from the timeline."""
+    if not timeline_width or not timeline_height or timeline_width == timeline_height:
+        return width, height, False
+    timeline_is_portrait = timeline_height > timeline_width
+    output_is_portrait = height > width
+    if timeline_is_portrait != output_is_portrait:
+        return height, width, True
+    return width, height, False
 
 
 def get_timeline_start_frame(timeline) -> int | None:
@@ -656,9 +694,12 @@ def check_media_same_package_tree(
         return (
             False,
             None,
-            "Timeline media spans multiple drives. "
-            "Keep all package media under one drive/folder tree "
-            "(e.g. D:/JobName/Video + D:/JobName/Audio).",
+            "時間軸素材分散在不同磁碟，請先使用 Resolve 的 Media Management（媒體管理）整理素材。\n\n"
+            "1. 開啟 File → Media Management，選擇 Timelines，勾選要匯出的時間軸。\n"
+            "2. 使用 Copy 或 Transcode，將素材集中到同一個專案資料夾。\n"
+            "3. 勾選 Relink to new files；若無法勾選，完成後請手動重新連結至新素材。\n"
+            "4. 確認目前時間軸已使用整理後的素材，再回到 ExportHelper 重新匯出。\n\n"
+            "只更改 ExportHelper 的輸出資料夾，無法解決素材分散的問題。",
         )
 
     # commonpath of files may land on a file if only one path; normalize to folder
@@ -1432,6 +1473,72 @@ def render_h264_mp4(
             pass
 
 
+def _srt_timestamp(frame: int, fps: float) -> str:
+    if fps <= 0:
+        raise ExportHelperError("Timeline frame rate is invalid; cannot export SRT.")
+    milliseconds = max(0, int(round((int(frame) / float(fps)) * 1000.0)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def export_timeline_srt(timeline, output_path: Path, fps: float) -> int:
+    """Write enabled Resolve subtitle tracks as a timeline-relative UTF-8 SRT."""
+    timeline_start = get_timeline_start_frame(timeline) or 0
+    cues: list[tuple[int, int, int, int, str]] = []
+    unreadable_items = 0
+    track_count = int(timeline.GetTrackCount("subtitle") or 0)
+    for track_index in range(1, track_count + 1):
+        try:
+            if not bool(timeline.GetIsTrackEnabled("subtitle", track_index)):
+                continue
+        except Exception:
+            pass
+        for item_index, item in enumerate(
+            timeline.GetItemListInTrack("subtitle", track_index) or []
+        ):
+            try:
+                start = _as_frame(item.GetStart())
+                end = _as_frame(item.GetEnd())
+                text = (
+                    str(item.GetName() or "")
+                    .replace("\r\n", "\n")
+                    .replace("\r", "\n")
+                    .strip()
+                )
+            except Exception:
+                unreadable_items += 1
+                continue
+            if start is None or end is None or end <= start or not text:
+                unreadable_items += 1
+                continue
+            cues.append((start, end, track_index, item_index, text))
+
+    if not cues:
+        detail = (
+            f" ({unreadable_items} subtitle item(s) could not be read)"
+            if unreadable_items
+            else ""
+        )
+        raise ExportHelperError(
+            "Current timeline has no readable subtitle items on enabled subtitle tracks"
+            f"{detail}."
+        )
+
+    cues.sort(key=lambda cue: (cue[0], cue[2], cue[3]))
+    blocks: list[str] = []
+    for cue_number, (start, end, _track, _order, text) in enumerate(cues, start=1):
+        relative_start = max(0, start - timeline_start)
+        relative_end = max(relative_start + 1, end - timeline_start)
+        blocks.append(
+            f"{cue_number}\n{_srt_timestamp(relative_start, fps)} --> "
+            f"{_srt_timestamp(relative_end, fps)}\n{text}"
+        )
+    output_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8-sig")
+    return len(cues)
+
+
 def export_current_timeline(
     media_root: Path,
     log: Callable[[str], None],
@@ -1441,17 +1548,28 @@ def export_current_timeline(
     export_xml: bool | None = None,
     export_aaf: bool | None = None,
     export_mp4: bool | None = None,
+    export_srt: bool | None = None,
+    auto_orient_video: bool = True,
 ) -> Path:
     state = current_timeline_state()
     config = state["config"]
     do_xml = bool(config.get("export_xml", True) if export_xml is None else export_xml)
     do_aaf = bool(config.get("export_aaf", True) if export_aaf is None else export_aaf)
     do_mp4 = bool(config.get("export_mp4", True) if export_mp4 is None else export_mp4)
-    if not (do_xml or do_aaf or do_mp4):
-        raise ExportHelperError("Enable at least one export: XML, AAF, or MOV.")
+    do_srt = bool(config.get("export_srt", False) if export_srt is None else export_srt)
+    if not (do_xml or do_aaf or do_mp4 or do_srt):
+        raise ExportHelperError("Enable at least one export: XML, AAF, MOV, or SRT.")
 
     width = int(mp4_width if mp4_width is not None else config["mp4_width"])
     height = int(mp4_height if mp4_height is not None else config["mp4_height"])
+    orientation_swapped = False
+    if auto_orient_video:
+        width, height, orientation_swapped = orient_dimensions_to_timeline(
+            width,
+            height,
+            state.get("timeline_width"),
+            state.get("timeline_height"),
+        )
     bitrate_mbps = float(
         mp4_bitrate_mbps if mp4_bitrate_mbps is not None else config["mp4_bitrate_mbps"]
     )
@@ -1477,8 +1595,8 @@ def export_current_timeline(
         elif message:
             log(f"Media package tree warning (check disabled): {message.splitlines()[0]}")
 
-    # 2) Output folder is free — deliverables are written directly here (no subfolder).
-    # Optional strict mode can also require media under that Output folder.
+    # 2) The selected folder is free. Deliverables go into a timeline-named child folder.
+    # Optional strict mode can also require media under the selected parent folder.
     outside = media_outside_folder(state["media_paths"], media_root)
     if outside:
         if bool(config.get("validate_media_under_selected_root", False)):
@@ -1491,30 +1609,53 @@ def export_current_timeline(
                 f"(OK — Output is only the deliverable destination). e.g. {sample}{more}"
             )
 
-    delivery = media_root
+    base_name = safe_name(source.GetName())
+    delivery = media_root / base_name
+    try:
+        delivery.mkdir(parents=False, exist_ok=True)
+    except OSError as exc:
+        raise ExportHelperError(
+            f"Could not create timeline output folder: {delivery}\n{exc}"
+        ) from exc
     log(f"Current timeline: {source.GetName()}")
-    log(f"Output folder: {media_root}")
+    log(f"Output folder: {delivery}")
     log(
         "Export selection: "
         f"XML={'ON' if do_xml else 'OFF'} / "
         f"AAF={'ON' if do_aaf else 'OFF'} / "
-        f"MP4={'ON' if do_mp4 else 'OFF'}"
+        f"MP4={'ON' if do_mp4 else 'OFF'} / "
+        f"SRT={'ON' if do_srt else 'OFF'}"
     )
+    if do_mp4 and orientation_swapped:
+        timeline_size = f"{state.get('timeline_width')}×{state.get('timeline_height')}"
+        log(
+            f"Video orientation matched to timeline {timeline_size}: "
+            f"output changed to {width}×{height}"
+        )
+    elif do_mp4 and not auto_orient_video:
+        log(f"Manual video dimensions retained: {width}×{height}")
     if state["recovered_from"]:
         log(f"Recovered from a previous failed copy; switched back to source timeline: {source.GetName()}")
     log(f"Media path check passed: {len(state['media_paths'])} files")
     source_video_items = count_items(source, "video")
     source_audio_items = count_items(source, "audio")
 
-    base_name = safe_name(source.GetName())
     xml_path: Path | None = None
     aaf_path: Path | None = None
     mp4_path: Path | None = None
+    srt_path: Path | None = None
     mp4_settings: dict | None = None
     video_name: str | None = None
     audio_name: str | None = None
     retained_empty_tracks: dict[str, list[int]] = {}
     resolve = state["resolve"]
+
+    if do_srt:
+        srt_path = delivery / f"{base_name}.srt"
+        cue_count = export_timeline_srt(
+            source, srt_path, float(state.get("timeline_fps") or 24.0)
+        )
+        log(f"SRT: exported {cue_count} cue(s)")
 
     if do_xml or do_aaf:
         try:
@@ -1569,7 +1710,7 @@ def export_current_timeline(
             if not project.SetCurrentTimeline(source):
                 log(f"Warning: could not switch back to source timeline: {source.GetName()}")
 
-    for label, artifact in (("XML", xml_path), ("AAF", aaf_path)):
+    for label, artifact in (("XML", xml_path), ("AAF", aaf_path), ("SRT", srt_path)):
         if artifact is None:
             continue
         if not artifact.is_file() or artifact.stat().st_size == 0:
@@ -1593,6 +1734,7 @@ def export_current_timeline(
             (do_xml, "XML"),
             (do_aaf, "AAF"),
             (do_mp4, "MOV"),
+            (do_srt, "SRT"),
         )
         if enabled
     ]
@@ -1606,6 +1748,8 @@ def export_current_timeline(
         log(f"AAF: {aaf_path}")
     if mp4_path:
         log(f"MOV: {mp4_path}")
+    if srt_path:
+        log(f"SRT: {srt_path}")
     if retained_empty_tracks:
         log(f"Cleared empty tracks on export copies: {retained_empty_tracks}")
     log(f"Done: {done_label} written to {delivery}")
@@ -1627,6 +1771,7 @@ def cli_main() -> int:
         action="store_true",
         help="Do not export MOV video (QuickTime H.264 / MP4 fallback)",
     )
+    parser.add_argument("--srt", action="store_true", help="Export timeline subtitles as SRT")
     args = parser.parse_args()
     if args.self_test:
         config = load_config()
@@ -1651,6 +1796,10 @@ def cli_main() -> int:
         assert render_container_extension("QuickTime") == ".mov"
         assert render_container_extension("mov") == ".mov"
         assert render_container_extension("mp4") == ".mp4"
+        assert orient_dimensions_to_timeline(1920, 1080, 1080, 1920) == (1080, 1920, True)
+        assert orient_dimensions_to_timeline(1080, 1920, 1920, 1080) == (1920, 1080, True)
+        assert orient_dimensions_to_timeline(1920, 1080, 1920, 1080) == (1920, 1080, False)
+        assert _srt_timestamp(24, 24.0) == "00:00:01,000"
         print("SELF_TEST_PASS")
         return 0
     if args.preflight:
@@ -1670,6 +1819,8 @@ def cli_main() -> int:
             "mark_in_tc": state.get("mark_in_tc"),
             "mark_out_tc": state.get("mark_out_tc"),
             "timeline_fps": state.get("timeline_fps"),
+            "timeline_width": state.get("timeline_width"),
+            "timeline_height": state.get("timeline_height"),
             "mark_source": state.get("mark_source"),
         }, ensure_ascii=False))
         return 0
@@ -1683,6 +1834,7 @@ def cli_main() -> int:
             export_xml=not args.skip_xml,
             export_aaf=not args.skip_aaf,
             export_mp4=not args.skip_mp4,
+            export_srt=args.srt,
         ))
         return 0
     launch_gui()
@@ -1993,6 +2145,8 @@ def launch_gui() -> None:
             export_xml: bool,
             export_aaf: bool,
             export_mp4: bool,
+            export_srt: bool,
+            auto_orient_video: bool,
             parent=None,
         ):
             super().__init__(parent)
@@ -2003,6 +2157,8 @@ def launch_gui() -> None:
             self.export_xml = export_xml
             self.export_aaf = export_aaf
             self.export_mp4 = export_mp4
+            self.export_srt = export_srt
+            self.auto_orient_video = auto_orient_video
 
         def run(self) -> None:
             try:
@@ -2015,6 +2171,8 @@ def launch_gui() -> None:
                     export_xml=self.export_xml,
                     export_aaf=self.export_aaf,
                     export_mp4=self.export_mp4,
+                    export_srt=self.export_srt,
+                    auto_orient_video=self.auto_orient_video,
                 )
                 self.finished_ok.emit(str(result))
             except Exception as exc:
@@ -2035,6 +2193,9 @@ def launch_gui() -> None:
             self._worker: ExportWorker | None = None
             self._drag_pos: QPoint | None = None
             self._timeline_summary = "Timeline not loaded"
+            self._timeline_name = "Resolve_Timeline"
+            self._timeline_resolution: tuple[int | None, int | None] = (None, None)
+            self._manual_orientation_override = False
 
             root = DotBackground()
             root.setObjectName("root")
@@ -2079,8 +2240,13 @@ def launch_gui() -> None:
             path_row = QHBoxLayout()
             path_row.setSpacing(8)
             self.media_root_edit = QLineEdit()
+            saved_output_folder = str(
+                self._config.get("last_output_folder", "")
+            ).strip()
+            if saved_output_folder and Path(saved_output_folder).is_dir():
+                self.media_root_edit.setText(saved_output_folder)
             self.media_root_edit.setPlaceholderText(
-                "Where to write XML / AAF / MOV video (any folder you like)…"
+                "Parent folder for the timeline-named export folder…"
             )
             browse_btn = QPushButton("Browse…")
             browse_btn.setObjectName("ghost")
@@ -2108,7 +2274,15 @@ def launch_gui() -> None:
             self.toggle_mp4 = self._make_export_toggle(
                 "MOV", bool(self._config.get("export_mp4", True))
             )
-            for btn in (self.toggle_xml, self.toggle_aaf, self.toggle_mp4):
+            self.toggle_srt = self._make_export_toggle(
+                "SRT", bool(self._config.get("export_srt", False))
+            )
+            for btn in (
+                self.toggle_xml,
+                self.toggle_aaf,
+                self.toggle_mp4,
+                self.toggle_srt,
+            ):
                 btn.toggled.connect(self._on_export_toggles_changed)
                 btn.installEventFilter(self)
                 toggle_row.addWidget(btn)
@@ -2129,9 +2303,19 @@ def launch_gui() -> None:
             self.width_edit = QLineEdit(str(self._config["mp4_width"]))
             self.height_edit = QLineEdit(str(self._config["mp4_height"]))
             self.bitrate_edit = QLineEdit(f"{float(self._config['mp4_bitrate_mbps']):g}")
+            self.width_edit.textEdited.connect(self._mark_manual_orientation_override)
+            self.height_edit.textEdited.connect(self._mark_manual_orientation_override)
             for edit in (self.width_edit, self.height_edit, self.bitrate_edit):
                 edit.setMaximumWidth(140)
             fields.addLayout(self._field_column("Width", self.width_edit))
+            self.swap_dimensions_btn = QPushButton("↔")
+            self.swap_dimensions_btn.setObjectName("swapDimensions")
+            self.swap_dimensions_btn.setFixedWidth(44)
+            self.swap_dimensions_btn.setToolTip("Swap width and height")
+            self.swap_dimensions_btn.clicked.connect(self._swap_dimensions)
+            fields.addWidget(
+                self.swap_dimensions_btn, 0, Qt.AlignmentFlag.AlignBottom
+            )
             fields.addLayout(self._field_column("Height", self.height_edit))
             fields.addLayout(
                 self._field_column("Restrict to（Mbps）", self.bitrate_edit)
@@ -2200,7 +2384,12 @@ def launch_gui() -> None:
             webbrowser.open("https://github.com/WiKiVibe")
 
         def eventFilter(self, obj, event):  # noqa: N802
-            toggles = (self.toggle_xml, self.toggle_aaf, self.toggle_mp4)
+            toggles = (
+                self.toggle_xml,
+                self.toggle_aaf,
+                self.toggle_mp4,
+                self.toggle_srt,
+            )
             if obj in toggles:
                 if event.type() == QEvent.Type.Enter:
                     # Hover brightness matches an active (glowing) key.
@@ -2278,11 +2467,12 @@ def launch_gui() -> None:
             btn.setText(f"{'●' if checked else '○'}  {name}")
             return btn
 
-        def _selected_exports(self) -> tuple[bool, bool, bool]:
+        def _selected_exports(self) -> tuple[bool, bool, bool, bool]:
             return (
                 self.toggle_xml.isChecked(),
                 self.toggle_aaf.isChecked(),
                 self.toggle_mp4.isChecked(),
+                self.toggle_srt.isChecked(),
             )
 
         def _apply_toggle_glow(self, btn: QPushButton) -> None:
@@ -2292,19 +2482,25 @@ def launch_gui() -> None:
                 clear_glow(btn)
 
         def _sync_toggle_labels(self) -> None:
-            for btn in (self.toggle_xml, self.toggle_aaf, self.toggle_mp4):
+            for btn in (
+                self.toggle_xml,
+                self.toggle_aaf,
+                self.toggle_mp4,
+                self.toggle_srt,
+            ):
                 name = btn.property("export_name")
                 btn.setText(f"{'●' if btn.isChecked() else '○'}  {name}")
                 self._apply_toggle_glow(btn)
 
         def _export_summary(self) -> str:
-            do_xml, do_aaf, do_mp4 = self._selected_exports()
+            do_xml, do_aaf, do_mp4, do_srt = self._selected_exports()
             parts = [
                 name
                 for enabled, name in (
                     (do_xml, "XML"),
                     (do_aaf, "AAF"),
                     (do_mp4, "MOV"),
+                    (do_srt, "SRT"),
                 )
                 if enabled
             ]
@@ -2316,14 +2512,15 @@ def launch_gui() -> None:
 
         def _on_export_toggles_changed(self, *_args) -> None:
             self._sync_toggle_labels()
-            do_xml, do_aaf, do_mp4 = self._selected_exports()
+            do_xml, do_aaf, do_mp4, do_srt = self._selected_exports()
             mp4_on = do_mp4
             self.width_edit.setEnabled(mp4_on)
             self.height_edit.setEnabled(mp4_on)
             self.bitrate_edit.setEnabled(mp4_on)
+            self.swap_dimensions_btn.setEnabled(mp4_on)
             self.mp4_card.setEnabled(mp4_on)
             self.export_btn.setText("Export")
-            enabled = bool(do_xml or do_aaf or do_mp4)
+            enabled = bool(do_xml or do_aaf or do_mp4 or do_srt)
             self.export_btn.setEnabled(enabled)
             if enabled:
                 make_white_glow(self.export_btn, blur=30, alpha=120, strong=False)
@@ -2344,19 +2541,52 @@ def launch_gui() -> None:
             self.toggle_xml.setEnabled(not busy)
             self.toggle_aaf.setEnabled(not busy)
             self.toggle_mp4.setEnabled(not busy)
+            self.toggle_srt.setEnabled(not busy)
             if busy:
                 self.export_btn.setEnabled(False)
                 self.width_edit.setEnabled(False)
                 self.height_edit.setEnabled(False)
                 self.bitrate_edit.setEnabled(False)
+                self.swap_dimensions_btn.setEnabled(False)
                 clear_glow(self.export_btn)
             else:
                 self._on_export_toggles_changed()
 
+        def _swap_dimensions(self) -> None:
+            width = self.width_edit.text()
+            self.width_edit.setText(self.height_edit.text())
+            self.height_edit.setText(width)
+            self._manual_orientation_override = True
+
+        def _mark_manual_orientation_override(self, *_args) -> None:
+            self._manual_orientation_override = True
+
+        def _match_video_orientation(self, *, log_change: bool) -> None:
+            try:
+                width = int(self.width_edit.text().strip())
+                height = int(self.height_edit.text().strip())
+            except ValueError:
+                return
+            timeline_width, timeline_height = self._timeline_resolution
+            width, height, swapped = orient_dimensions_to_timeline(
+                width, height, timeline_width, timeline_height
+            )
+            if not swapped:
+                self._manual_orientation_override = False
+                return
+            self.width_edit.setText(str(width))
+            self.height_edit.setText(str(height))
+            self._manual_orientation_override = False
+            if log_change:
+                self.append_log(
+                    f"Video orientation matched to timeline {timeline_width}×{timeline_height}: "
+                    f"{width}×{height}"
+                )
+
         def choose_root(self) -> None:
             selected = QFileDialog.getExistingDirectory(
                 self,
-                "Select output folder (files are written here directly)",
+                "Select parent folder for timeline exports",
                 self.media_root_edit.text().strip() or str(Path.home()),
             )
             if selected:
@@ -2365,7 +2595,12 @@ def launch_gui() -> None:
         def refresh_state(self, show_error: bool = True) -> bool:
             try:
                 state = current_timeline_state()
+                self._timeline_resolution = (
+                    state.get("timeline_width"),
+                    state.get("timeline_height"),
+                )
                 timeline_name = state["timeline"].GetName()
+                self._timeline_name = str(timeline_name)
                 v_count = int(state["timeline"].GetTrackCount("video"))
                 a_count = int(state["timeline"].GetTrackCount("audio"))
                 media_count = len(state["media_paths"])
@@ -2402,12 +2637,9 @@ def launch_gui() -> None:
                 self._set_timeline_status(
                     f"{timeline_name} ; V{v_count}/A{a_count}/{media_count}Media"
                 )
-                if state.get("inferred_root"):
+                if not self.media_root_edit.text().strip() and state.get("inferred_root"):
                     self.media_root_edit.setText(str(state["inferred_root"]))
-                else:
-                    # Keep any path the user already typed; don't wipe the field.
-                    if not self.media_root_edit.text().strip():
-                        self.media_root_edit.setText("")
+                self._match_video_orientation(log_change=True)
                 if state["recovered_from"]:
                     self.append_log(
                         f"Detected previous failed copy {state['recovered_from']}; switched back to source timeline."
@@ -2457,10 +2689,12 @@ def launch_gui() -> None:
                 return False
 
         def export_clicked(self) -> None:
-            do_xml, do_aaf, do_mp4 = self._selected_exports()
-            if not (do_xml or do_aaf or do_mp4):
+            do_xml, do_aaf, do_mp4, do_srt = self._selected_exports()
+            if not (do_xml or do_aaf or do_mp4 or do_srt):
                 QMessageBox.warning(
-                    self, "Nothing selected", "Enable at least one of: XML, AAF, or MOV."
+                    self,
+                    "Nothing selected",
+                    "Enable at least one of: XML, AAF, MOV, or SRT.",
                 )
                 return
 
@@ -2469,7 +2703,8 @@ def launch_gui() -> None:
                 QMessageBox.critical(
                     self,
                     "Folder error",
-                    "Please select an output folder. XML / AAF / MOV video are written there directly.",
+                    "Please select a parent output folder. "
+                    "A timeline-named folder will be created inside it.",
                 )
                 return
 
@@ -2501,14 +2736,13 @@ def launch_gui() -> None:
                     "export_xml": do_xml,
                     "export_aaf": do_aaf,
                     "export_mp4": do_mp4,
+                    "export_srt": do_srt,
                     "mp4_width": width,
                     "mp4_height": height,
                     "mp4_bitrate_mbps": bitrate,
+                    "last_output_folder": str(selected_root.resolve(strict=False)),
                 }
             )
-            save_config(updated)
-            self._config = updated
-
             lines = ["Will export:\n"]
             if do_xml:
                 lines.append("• Video-only XML")
@@ -2519,6 +2753,9 @@ def launch_gui() -> None:
                     f"• MOV (H.264, MP4 fallback) In/Out "
                     f"({width}×{height} / Restrict to {bitrate:g} Mbps)"
                 )
+            if do_srt:
+                lines.append("• SRT (timeline name)")
+            lines.append(f"\nOutput subfolder: {safe_name(self._timeline_name)}")
             lines.append("\nThe original timeline will not be modified.")
             reply = QMessageBox.question(
                 self,
@@ -2530,6 +2767,8 @@ def launch_gui() -> None:
             if reply != QMessageBox.StandardButton.Ok:
                 return
 
+            save_config(updated)
+            self._config = updated
             self.set_busy(True)
             self.append_log(f"Starting export: {self._export_summary()}…")
             worker = ExportWorker(
@@ -2540,6 +2779,8 @@ def launch_gui() -> None:
                 do_xml,
                 do_aaf,
                 do_mp4,
+                do_srt,
+                not self._manual_orientation_override,
                 self,
             )
             worker.log_line.connect(self.append_log)

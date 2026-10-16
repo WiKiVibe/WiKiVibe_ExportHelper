@@ -8,6 +8,8 @@
   "export_xml": true,
   "export_aaf": true,
   "export_mp4": true,
+  "export_srt": false,
+  "last_output_folder": "",
   "ui_dot_step": 14,
   "ui_dot_radius": 1.5,
   "ui_dot_alpha": 20
